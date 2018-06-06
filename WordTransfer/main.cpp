@@ -122,9 +122,6 @@ cv::Mat normalizedDistanceEstimation(cv::Mat source) {
     std::cout << "|edge(Sigma)| = " << nSkeleton << std::endl;
     std::cout << "|skel(Sigma)| = " << nEdge << std::endl;
     
-    cv::imshow("Distance Map", sourceSkeleton);
-    cvWaitKey(0);
-    
     cv::flann::KDTreeIndexParams indexParams(2);
     cv::flann::Index edgeKDTree(cv::Mat(edgeSet).reshape(1), indexParams);
     cv::flann::Index skelKDTree(cv::Mat(skeletonSet).reshape(1), indexParams);
@@ -147,6 +144,7 @@ cv::Mat normalizedDistanceEstimation(cv::Mat source) {
         if (r % (result.rows / 9) == 0 || r == result.rows - 1) {
             std::cout << ".";
         }
+#pragma omp parallel for
         for (int c = 0; c < result.cols; c++) {
             cv::Point2f q(r, c);
             
@@ -154,10 +152,8 @@ cv::Mat normalizedDistanceEstimation(cv::Mat source) {
             float dist = distanceFromPointToPixelSet(q, edgeSet, edgeKDTree, qNearest);
             
             if (source.at<uchar>(r, c) > 127) {
-                // inside Source
                 dist = 1 - dist / std::max(minRQ, distanceFromPointToPixelSet(qNearest, skeletonSet, skelKDTree));
             } else {
-                // outside Source
                 dist = 1 + dist / meanTextWidth;
             }
             
@@ -177,17 +173,16 @@ void resizeImage(std::string fileName) {
 }
 
 float distanceToCorrespondance(std::vector<float> query, cv::flann::Index& kdtree) {
-    std::vector<int> indices(10);
-    std::vector<float> dists(10);
+    std::vector<int> indices(2);
+    std::vector<float> dists(2);
     cv::flann::SearchParams params(128);
-    kdtree.knnSearch(query, indices, dists, 10, params);
+    kdtree.knnSearch(query, indices, dists, 2, params);
     
     return std::sqrt(dists[1]);
 }
 
 cv::Mat patchScaleDetection(cv::Mat source, cv::Mat source_) {
-    // Define M = 3
-    const int L = 5;
+    const int L = 6;
     const float W = 50;
     
     std::cout << "Patch Scale Detection Start" << std::endl;
@@ -198,7 +193,7 @@ cv::Mat patchScaleDetection(cv::Mat source, cv::Mat source_) {
     
     for (int l = L; l >= 2; l--) {
         std::cout << l << " ";
-        int s = 1 << (l - 1);
+        int s = pow(2, l - 1);
         cv::Mat scaled;
         cv::Mat scaled_;
         cv::resize(source, scaled, cv::Size(source.rows / s, source.cols / s));
@@ -207,21 +202,20 @@ cv::Mat patchScaleDetection(cv::Mat source, cv::Mat source_) {
         cv::Mat features((scaled.rows - 2) * (scaled.cols - 2), 9, CV_32FC1);
         cv::Mat features_((scaled_.rows - 2) * (scaled_.cols - 2), 9, CV_32FC1);
         
-        int id = 0;
         for (int r = 1; r + 1 < scaled.rows; r++) {
+#pragma openmp parallel for
             for (int c = 1; c + 1 < scaled.cols; c++) {
                 if (result.at<float>(r * s, c * s) == 0) {
                     int k = 0;
                     for (int sr = r - 1; sr <= r + 1; sr++) {
                         for (int sc = c - 1; sc <= c + 1; sc++) {
-                            features.at<float>(id, k) = (float)scaled.at<uchar>(sr, sc);
-                            features_.at<float>(id, k) = (float)scaled_.at<uchar>(sr, sc);
+                            features.at<float>(r - 1, k) = (float)scaled.at<uchar>(sr, sc);
+                            features_.at<float>(r - 1, k) = (float)scaled_.at<uchar>(sr, sc);
                             k++;
                         }
                     }
                 }
             }
-            id++;
         }
         
         
@@ -230,6 +224,7 @@ cv::Mat patchScaleDetection(cv::Mat source, cv::Mat source_) {
         cv::flann::Index kdtree_(features_, indexParams, cvflann::FLANN_DIST_EUCLIDEAN);
         
         for (int r = 1; r + 1 < scaled.rows; r++) {
+#pragma openmp parallel for
             for (int c = 1; c + 1 < scaled.cols; c++) {
                 if (result.at<float>(r * s, c * s) == 0) {
                     std::vector<float> feature;
@@ -260,7 +255,9 @@ cv::Mat patchScaleDetection(cv::Mat source, cv::Mat source_) {
                     if (dL + sigmaL < W) {
                         for (int sr = r * s; sr < (r + 1) * s; sr++) {
                             for (int sc = c * s; sc < (c + 1) * s; sc++) {
-                                result.at<float>(sr, sc) = l;
+                                if (result.at<float>(sr, sc) == 0) {
+                                    result.at<float>(sr, sc) = l;
+                                }
                             }
                         }
                     }
@@ -269,6 +266,15 @@ cv::Mat patchScaleDetection(cv::Mat source, cv::Mat source_) {
         }
     }
     std::cout << "1" << std::endl;
+    
+    for (int r = 0; r < result.rows; r++) {
+        for (int c = 0; c < result.cols; c++) {
+            if (result.at<float>(r, c) == 0) {
+                result.at<float>(r, c) = 1;
+            }
+        }
+    }
+    
     std::cout << "Patch Scale Detection End" << std::endl;
     
     return result;
@@ -302,8 +308,8 @@ std::vector<cv::Point> getUnfilledPixels(cv::Mat valid) {
         for (int i = 0; i < order.size(); i++) {
             order[i] = i;
         }
-        for (int i = 0; i < order.size(); i++) {
-            int j = rand() % (i + 1);
+        for (int i = 1; i < order.size(); i++) {
+            int j = rand() % i;
             std::swap(order[i], order[j]);
         }
         for (int i = 0; i < order.size(); i++) {
@@ -329,10 +335,7 @@ cv::Mat gaussianKernel(cv::Size size, float sigma) {
     return gauss2D;
 }
 
-cv::Point randomPickBestMatches(cv::Mat temp, cv::Mat valid, cv::Mat sample, float& error) {
-    const float errThreshold = 0.1;
-    const float sigma = sqrt(temp.rows * temp.cols) / 6.4;
-    cv::Mat gauss2D = gaussianKernel(temp.size(), sigma);
+cv::Mat gaussianValidKernel(cv::Mat gauss2D, cv::Mat valid) {
     cv::Mat kernel(gauss2D.size(), CV_32F, cv::Scalar(0));
     
     float totWeight = 0;
@@ -344,9 +347,38 @@ cv::Point randomPickBestMatches(cv::Mat temp, cv::Mat valid, cv::Mat sample, flo
     }
     kernel = kernel / totWeight;
     
-    //cv::Mat ssd;
-    //cv::filter2D(sample, ssd, -1, kernel);
-    //ssd = ssd(cv::Rect(0, 0, ssd.cols - kernel.cols + 1, ssd.rows - kernel.rows + 1));
+    return kernel;
+}
+
+cv::Point randomPickMatchFromSSD(cv::Mat ssd, cv::Mat kernel, float& error) {
+    const float errThreshold = 0.1;
+    cv::Point bestMatch;
+    
+    double minSSD, maxSSD;
+    cv::minMaxLoc(ssd, &minSSD, &maxSSD);
+    float threshold = minSSD * (1 + errThreshold);
+    
+    int cnt = 0;
+    for (int r = 0; r < ssd.rows; r++) {
+        for (int c = 0; c < ssd.cols; c++) {
+            if (ssd.at<float>(r, c) < threshold) {
+                cnt++;
+                if (rand() % cnt == 0) {
+                    error = ssd.at<float>(r, c);
+                    bestMatch = cv::Point(r + kernel.rows / 2, c + kernel.cols / 2);
+                }
+            }
+        }
+    }
+    
+    return bestMatch;
+}
+
+cv::Point randomPickBestMatches(cv::Mat temp, cv::Mat valid, cv::Mat sample, float& error) {
+    const float errThreshold = 0.1;
+    const float sigma = sqrt(temp.rows * temp.cols) / 6.4;
+    cv::Mat gauss2D = gaussianKernel(temp.size(), sigma);
+    cv::Mat kernel = gaussianValidKernel(gauss2D, valid);
     
     cv::Mat ssd(cv::Size(sample.rows - kernel.rows + 1, sample.cols - kernel.cols + 1), CV_32F, cv::Scalar(0));
 #pragma omp parallel for
@@ -367,25 +399,43 @@ cv::Point randomPickBestMatches(cv::Mat temp, cv::Mat valid, cv::Mat sample, flo
     }
     
     
-    cv::Point bestMatch;
+    cv::Point bestMatch = randomPickMatchFromSSD(ssd, kernel, error);
+    return bestMatch;
+}
+
+cv::Point randomPickBestMatches(cv::Mat temp, cv::Mat temp_, cv::Mat tempValid, cv::Mat tempDist, cv::Mat sample, cv::Mat sample_, cv::Mat sampleDist, float maxTargetDist, float& error) {
+    const float lambda1 = 0.2f;
+    const float lambda2 = 0.0f;
+    const float lambda3 = 0.5f;
     
-    double minSSD, maxSSD;
-    cv::minMaxLoc(ssd, &minSSD, &maxSSD);
-    float threshold = minSSD * (1 + errThreshold);
+    const float sigma = sqrt(temp.rows * temp.cols) / 6.4;
+    cv::Mat gauss2D = gaussianKernel(temp.size(), sigma);
+    cv::Mat kernel = gaussianValidKernel(gauss2D, tempValid);
     
-    int cnt = 0;
+    cv::Mat ssd(cv::Size(sample.rows - kernel.rows + 1, sample.cols - kernel.cols + 1), CV_32F, cv::Scalar(0));
+#pragma omp parallel for
     for (int r = 0; r < ssd.rows; r++) {
         for (int c = 0; c < ssd.cols; c++) {
-            if (ssd.at<float>(r, c) < threshold) {
-                cnt++;
-                if (rand() % cnt == 0) {
-                    error = ssd.at<float>(r, c);
-                    bestMatch = cv::Point(r + kernel.rows / 2, c + kernel.cols / 2);
+            for (int rr = 0; rr < kernel.rows; rr++) {
+                for (int cc = 0; cc < kernel.cols; cc++) {
+                    int sr = r + rr;
+                    int sc = c + cc;
+                    float distTexture2 = pow(temp_.at<uchar>(rr, cc) - sample_.at<uchar>(sr, sc), 2) / 65536.0;
+                    float distFont2 = pow(temp.at<uchar>(rr, cc) - sample.at<uchar>(sr, sc), 2) / 65536.0;
+                    float Eapp = lambda3 * distFont2 + distTexture2;
+                    float Edist = pow(tempDist.at<float>(rr, cc) - sampleDist.at<float>(sr, sc), 2) / std::max(1.0f, maxTargetDist * maxTargetDist);
+                    float Efinal = Eapp + lambda1 * Edist;
+                    ssd.at<float>(r, c) += Efinal * kernel.at<float>(rr, cc);
                 }
+            }
+            
+            if (ssd.at<float>(r, c) == 0) {
+                ssd.at<float>(r, c) = 255;
             }
         }
     }
     
+    cv::Point bestMatch = randomPickMatchFromSSD(ssd, kernel, error);
     return bestMatch;
 }
 
@@ -448,40 +498,141 @@ cv::Mat textureSynthesis(cv::Mat sample, cv::Size windowSize) {
     }
     
     return result;
+    
+    /* //How to use?
+    cv::Mat sample = cv::imread("1.jpg", 1);
+    cv::Mat result = textureSynthesis(sample, cv::Size(5, 5));
+    cv::imshow("Texture Synthesis", result);
+    cvWaitKey(0);
+    cv::imwrite("result.jpg", result);*/
 }
 
-int main() {
-    // Show Distance Map
-    /*cv::Mat source = cv::imread("S.png", 0);
-    cv::Mat sourceBinary(source.size(), CV_8UC1, cv::Scalar(0));
-    cv::threshold(source, sourceBinary, 127, 255, cv::THRESH_BINARY);
+cv::Mat textSynthesis(cv::Mat source, cv::Mat source_, cv::Mat target, cv::Mat sourceDist, cv::Mat targetDist, cv::Mat sourceScale, cv::Size windowSize) {
+    cv::Mat source_Gray;
+    cv::cvtColor(source_, source_Gray, CV_BGR2GRAY);
+    cv::Mat result(target.size(), CV_8UC3);
     
-    cv::Mat distanceMap = normalizedDistanceEstimation(sourceBinary);
-    cv::Mat heatMap = getHeatMap(distanceMap);
+    //Initialization at the edge
+    cv::Mat source_AtTargetScale;
+    cv::resize(source_, source_AtTargetScale, target.size());
+    cv::Mat valid(result.size(), CV_32F, cv::Scalar(0));
+    for (int r = 0; r < result.rows; r++) {
+        for (int c = 0; c < result.cols; c++) {
+            if (r == 0 || r == result.rows - 1 || c == 0 || c == result.cols - 1) {
+                valid.at<float>(r, c) = 1;
+                result.at<cv::Vec3b>(r, c) = source_AtTargetScale.at<cv::Vec3b>(r, c);
+            }
+        }
+    }
     
-    cv::Mat sourceEdge = calnEdge(sourceBinary);
-    cv::Mat coloredEdge;
-    cv::cvtColor(sourceEdge, coloredEdge, cv::COLOR_GRAY2RGB);
-    cv::Mat combination(source.size(), CV_8UC3, cv::Scalar(0));
-    cv::bitwise_or(coloredEdge, heatMap, combination);
+    double minTargetDist, maxTargetDist;
+    cv::minMaxLoc(targetDist, &minTargetDist, &maxTargetDist);
     
-    cv::imshow("Distance Map", combination);
-    cvWaitKey(0);*/
+    float maxErrThreshold = 0.3;
+    int remain = valid.rows * valid.cols - cv::sum(valid)[0];
     
-    // Show Scaled Map
-    /*cv::Mat source = cv::imread("S.png", 0);
+    while (remain > 0) {
+        std::cout << remain << std::endl;
+        cv::imwrite("result.jpg", result);
+        
+        bool progress = false;
+        std::vector<cv::Point> pixelList = getUnfilledPixels(valid);
+        
+        for (int i = 0; i < pixelList.size(); i++) {
+            cv::Point p = pixelList[i];
+            
+            cv::Mat temp(windowSize, CV_8UC1, cv::Scalar(0));
+            cv::Mat temp_(windowSize, CV_8UC3, cv::Scalar(0));
+            cv::Mat tempValid(windowSize, CV_32F, cv::Scalar(0));
+            cv::Mat tempDist(windowSize, CV_32F, cv::Scalar(0));
+            for (int r = 0; r < temp.rows; r++) {
+                for (int c = 0; c < temp.cols; c++) {
+                    int tr = p.x - windowSize.height / 2 + r;
+                    int tc = p.y - windowSize.width / 2 + c;
+                    if (0 <= tr && tr < result.rows && 0 <= tc && tc < result.cols) {
+                        temp.at<uchar>(r, c) = target.at<uchar>(tr, tc);
+                        temp_.at<cv::Vec3b>(r, c) = result.at<cv::Vec3b>(tr, tc);
+                        tempValid.at<float>(r, c) = valid.at<float>(tr, tc);
+                        tempDist.at<float>(r, c) = targetDist.at<float>(tr, tc);
+                    }
+                }
+            }
+            cv::cvtColor(temp_, temp_, CV_BGR2GRAY);
+            
+            float error = 0;
+            cv::Point bestMatch = randomPickBestMatches(temp, temp_, tempValid, tempDist, source, source_Gray, sourceDist, (float)maxTargetDist, error);
+            error /= 255;
+            if (error < maxErrThreshold) {
+                result.at<cv::Vec3b>(p.x, p.y) = source_.at<cv::Vec3b>(bestMatch.x, bestMatch.y);
+                remain--;
+                valid.at<float>(p.x, p.y) = 1;
+                progress = true;
+            }
+        }
+        
+        if (progress == false) {
+            maxErrThreshold *= 1.1;
+        }
+    }
+    
+    return result;
+}
+
+void resizeImage(std::string fileName, cv::Size size) {
+    cv::Mat source = cv::imread(fileName, 1);
+    cv::resize(source, source, size);
+    cv::imwrite(fileName, source);
+}
+
+#define TEXT_ESTIMATION
+
+int main() {    
+    //Source Distance
+    cv::Mat source = cv::imread("S.png", 0);
+    cv::threshold(source, source, 127, 255, cv::THRESH_BINARY);
+    cv::Mat sourceDist;
+#ifdef TEXT_ESTIMATION
+    sourceDist = normalizedDistanceEstimation(source);
+    cv::Mat sourceDistSave = sourceDist * 16;
+    cv::imwrite("S_Dist.png", sourceDistSave);
+#else
+    sourceDist = cv::imread("S_Dist.png", 0);
+    sourceDist.convertTo(sourceDist, CV_32F);
+    sourceDist = sourceDist / 16;
+#endif
+    
+    //Target Distance
+    cv::Mat target = cv::imread("T.png", 0);
+    cv::threshold(target, target, 127, 255, cv::THRESH_BINARY);
+    cv::Mat targetDist;
+#ifdef TEXT_ESTIMATION
+    targetDist = normalizedDistanceEstimation(target);
+    cv::Mat targetDistSave = targetDist * 16;
+    cv::imwrite("T_Dist.png", targetDistSave);
+#else
+    targetDist = cv::imread("T_Dist.png", 0);
+    targetDist.convertTo(targetDist, CV_32F);
+    targetDist = targetDist / 16;
+#endif
+    
+    //Source Scale Map
     cv::Mat source_ = cv::imread("S_.png", 1);
-    cv::Mat patchScaleMap = patchScaleDetection(source, source_);
-    cv::Mat normalizedMap = getNormalizedMap(patchScaleMap);
-    cv::imshow("Scaled Map", normalizedMap);
-    cvWaitKey(0);*/
+    cv::Mat sourceScale;
+#ifdef TEXT_ESTIMATION
+    sourceScale = patchScaleDetection(source, source_);
+    cv::Mat sourceScaleSave = sourceScale * 40;
+    cv::imwrite("S_Scale.png", sourceScaleSave);
+#else
+    sourceScale = cv::imread("S_Scale.png", 0);
+    sourceScale.convertTo(sourceScale, CV_32F);
+    sourceScale = sourceScale / 40;
+#endif
     
-    //Texture Synthesis
-    cv::Mat sample = cv::imread("2.png", 1);
-    cv::Mat result = textureSynthesis(sample, cv::Size(5, 5));
+    cv::Mat result = textSynthesis(source, source_, target, sourceDist, targetDist, sourceScale, cv::Size(5, 5));
     cv::imshow("Texture Synthesis", result);
     cvWaitKey(0);
     cv::imwrite("result.jpg", result);
     
+    std::cout << "Finished" << std::endl;
     return 0;
 }
